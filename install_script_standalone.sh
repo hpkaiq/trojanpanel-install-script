@@ -3,7 +3,7 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
 # System Required: CentOS 7+/Ubuntu 18+/Debian 10+
-# Version: v1.0.0
+# Version: v2.0.4
 # Description: One click Install Trojan Panel standalone server
 # Author: jonssonyan <https://jonssonyan.com>
 # Github: https://github.com/trojanpanel/install-script
@@ -26,16 +26,21 @@ init_var() {
 
   # Caddy
   CADDY_DATA="/tpdata/caddy/"
-  CADDY_Caddyfile="/tpdata/caddy/Caddyfile"
+  CADDY_Config="/tpdata/caddy/config.json"
   CADDY_SRV="/tpdata/caddy/srv/"
-  CADDY_ACME="/tpdata/caddy/acme/"
+  CADDY_CERT="/tpdata/caddy/cert/"
+  CADDY_LOG="/tpdata/caddy/logs/"
   DOMAIN_FILE="/tpdata/caddy/domain.lock"
+  CADDY_CERT_DIR="/tpdata/caddy/cert/certificates/acme-v02.api.letsencrypt.org-directory/"
   domain=""
+  caddy_port=80
   caddy_remote_port=8863
-  your_email="123456@qq.com"
+  your_email=""
+  ssl_option=1
+  ssl_module_type=1
+  ssl_module="acme"
   crt_path=""
   key_path=""
-  ssl_option=1
 
   # trojanGFW
   TROJANGFW_DATA="/tpdata/trojanGFW/"
@@ -63,6 +68,13 @@ init_var() {
   hysteria_protocol="udp"
   hysteria_up_mbps=100
   hysteria_down_mbps=100
+
+  # naiveproxy
+  NAIVEPROXY_DATA="/tpdata/naiveproxy/"
+  NAIVEPROXY_STANDALONE_CONFIG="/tpdata/naiveproxy/standalone_config.json"
+  naiveproxy_port=443
+  naiveproxy_username=""
+  naiveproxy_pass=""
 }
 
 echo_content() {
@@ -97,9 +109,10 @@ mkdir_tools() {
 
   # Caddy
   mkdir -p ${CADDY_DATA}
-  touch ${CADDY_Caddyfile}
+  touch ${CADDY_Config}
   mkdir -p ${CADDY_SRV}
-  mkdir -p ${CADDY_ACME}
+  mkdir -p ${CADDY_CERT}
+  mkdir -p ${CADDY_LOG}
 
   # trojanGFW
   mkdir -p ${TROJANGFW_DATA}
@@ -112,6 +125,10 @@ mkdir_tools() {
   # hysteria
   mkdir -p ${HYSTERIA_DATA}
   touch ${HYSTERIA_STANDALONE_CONFIG}
+
+  # naiveproxy
+  mkdir -p ${NAIVEPROXY_DATA}
+  touch ${NAIVEPROXY_STANDALONE_CONFIG}
 }
 
 can_connect() {
@@ -230,9 +247,12 @@ install_caddy_tls() {
     wget --no-check-certificate -O ${CADDY_DATA}html.tar.gz ${STATIC_HTML} &&
       tar -zxvf ${CADDY_DATA}html.tar.gz -C ${CADDY_SRV}
 
-    read -r -p "请输入Caddy的转发端口(用于申请证书,默认:8863): " caddy_remote_port
+    read -r -p "请输入Caddy的端口(默认:80): " caddy_port
+    [[ -z "${caddy_port}" ]] && caddy_port=80
+    read -r -p "请输入Caddy的转发端口(默认:8863): " caddy_remote_port
     [[ -z "${caddy_remote_port}" ]] && caddy_remote_port=8863
 
+    echo_content yellow "提示：请确认域名已经解析到本机 否则可能安装失败"
     while read -r -p "请输入你的域名(必填): " domain; do
       if [[ -z "${domain}" ]]; then
         echo_content red "域名不能为空"
@@ -241,91 +261,322 @@ install_caddy_tls() {
       fi
     done
 
-    mkdir "${CADDY_ACME}${domain}"
+    read -r -p "请输入你的邮箱(可选): " your_email
 
     while read -r -p "请选择设置证书的方式?(1/自动申请和续签证书 2/手动设置证书路径 默认:1/自动申请和续签证书): " ssl_option; do
       if [[ -z ${ssl_option} || ${ssl_option} == 1 ]]; then
+        while read -r -p "请选择申请证书的方式(1/acme 2/zerossl 默认:1/acme): " ssl_module_type; do
+          if [[ -z "${ssl_module_type}" || ${ssl_module_type} == 1 ]]; then
+            ssl_module="acme"
+            CADDY_CERT_DIR="/tpdata/caddy/cert/certificates/acme-v02.api.letsencrypt.org-directory/"
+            break
+          elif [[ ${ssl_module_type} == 2 ]]; then
+            ssl_module="zerossl"
+            CADDY_CERT_DIR="/tpdata/caddy/cert/certificates/acme.zerossl.com-v2-dv90/"
+            break
+          else
+            echo_content red "不可以输入除1和2之外的其他字符"
+          fi
+        done
 
-        echo_content yellow "正在检测域名,请稍后..."
-        ping_ip=$(ping "${domain}" -s1 -c1 | grep "ttl=" | head -n1 | cut -d"(" -f2 | cut -d")" -f1)
-        curl_ip=$(curl ifconfig.me)
-        if [[ "${ping_ip}" != "${curl_ip}" ]]; then
-          echo_content yellow "你的域名没有解析到本机IP,请稍后再试"
-          echo_content red "---> Caddy安装失败"
-          exit 0
-        fi
-
-        read -r -p "请输入你的邮箱(用于申请证书,默认:123456@qq.com): " your_email
-        [[ -z "${your_email}" ]] && your_email="123456@qq.com"
-
-        cat >${CADDY_Caddyfile} <<EOF
-http://${domain}:80 {
-    redir https://${domain}:${caddy_remote_port}{url}
+        cat >${CADDY_Config} <<EOF
+{
+    "admin":{
+        "disabled":true
+    },
+    "logging":{
+        "logs":{
+            "default":{
+                "writer":{
+                    "output":"file",
+                    "filename":"${CADDY_LOG}error.log"
+                },
+                "level":"ERROR"
+            }
+        }
+    },
+    "storage":{
+        "module":"file_system",
+        "root":"${CADDY_CERT}"
+    },
+    "apps":{
+        "http":{
+            "http_port": ${caddy_port},
+            "servers":{
+                "srv0":{
+                    "listen":[
+                        ":${caddy_port}"
+                    ],
+                    "routes":[
+                        {
+                            "match":[
+                                {
+                                    "host":[
+                                        "${domain}"
+                                    ]
+                                }
+                            ],
+                            "handle":[
+                                {
+                                    "handler":"static_response",
+                                    "headers":{
+                                        "Location":[
+                                            "https://{http.request.host}:${caddy_remote_port}{http.request.uri}"
+                                        ]
+                                    },
+                                    "status_code":301
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "srv1":{
+                    "listen":[
+                        ":${caddy_remote_port}"
+                    ],
+                    "routes":[
+                        {
+                            "handle":[
+                                {
+                                    "handler":"subroute",
+                                    "routes":[
+                                        {
+                                            "match":[
+                                                {
+                                                    "host":[
+                                                        "${domain}"
+                                                    ]
+                                                }
+                                            ],
+                                            "handle":[
+                                                {
+                                                    "handler":"file_server",
+                                                    "root":"${CADDY_SRV}",
+                                                    "index_names":[
+                                                        "index.html",
+                                                        "index.htm"
+                                                    ]
+                                                }
+                                            ],
+                                            "terminal":true
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                    "tls_connection_policies":[
+                        {
+                            "match":{
+                                "sni":[
+                                    "${domain}"
+                                ]
+                            }
+                        }
+                    ],
+                    "automatic_https":{
+                        "disable":true
+                    }
+                }
+            }
+        },
+        "tls":{
+            "certificates":{
+                "automate":[
+                    "${domain}"
+                ]
+            },
+            "automation":{
+                "policies":[
+                    {
+                        "issuers":[
+                            {
+                                "module":"${ssl_module}",
+                                "email":"${your_email}"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    }
 }
-https://${domain}:${caddy_remote_port} {
-    gzip
-    tls ${your_email}
-    root ${CADDY_SRV}
+EOF
+        break
+      elif [[ ${ssl_option} == 2 ]]; then
+        while read -r -p "请输入证书的.crt文件路径(必填): " crt_path; do
+          if [[ -z "${crt_path}" ]]; then
+            echo_content red "路径不能为空"
+          else
+            if [[ ! -f "${crt_path}" ]]; then
+              echo_content red "证书的.crt文件路径不存在"
+            else
+              cp "${crt_path}" "${CADDY_CERT}${domain}.crt"
+              break
+            fi
+          fi
+        done
+
+        while read -r -p "请输入证书的.key文件路径(必填): " key_path; do
+          if [[ -z "${key_path}" ]]; then
+            echo_content red "路径不能为空"
+          else
+            if [[ ! -f "${key_path}" ]]; then
+              echo_content red "证书的.key文件路径不存在"
+            else
+              cp "${key_path}" "${CADDY_CERT}${domain}.key"
+              break
+            fi
+          fi
+        done
+
+        cat >${CADDY_Config} <<EOF
+{
+    "admin":{
+        "disabled":true
+    },
+    "logging":{
+        "logs":{
+            "default":{
+                "writer":{
+                    "output":"file",
+                    "filename":"${CADDY_LOG}error.log"
+                },
+                "level":"ERROR"
+            }
+        }
+    },
+    "storage":{
+        "module":"file_system",
+        "root":"${CADDY_CERT}"
+    },
+    "apps":{
+        "http":{
+            "http_port": ${caddy_port},
+            "servers":{
+                "srv0":{
+                    "listen":[
+                        ":${caddy_port}"
+                    ],
+                    "routes":[
+                        {
+                            "match":[
+                                {
+                                    "host":[
+                                        "${domain}"
+                                    ]
+                                }
+                            ],
+                            "handle":[
+                                {
+                                    "handler":"static_response",
+                                    "headers":{
+                                        "Location":[
+                                            "https://{http.request.host}:${caddy_remote_port}{http.request.uri}"
+                                        ]
+                                    },
+                                    "status_code":301
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "srv1":{
+                    "listen":[
+                        ":${caddy_remote_port}"
+                    ],
+                    "routes":[
+                        {
+                            "handle":[
+                                {
+                                    "handler":"subroute",
+                                    "routes":[
+                                        {
+                                            "match":[
+                                                {
+                                                    "host":[
+                                                        "${domain}"
+                                                    ]
+                                                }
+                                            ],
+                                            "handle":[
+                                                {
+                                                    "handler":"file_server",
+                                                    "root":"${CADDY_SRV}",
+                                                    "index_names":[
+                                                        "index.html",
+                                                        "index.htm"
+                                                    ]
+                                                }
+                                            ],
+                                            "terminal":true
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                    "tls_connection_policies":[
+                        {
+                            "match":{
+                                "sni":[
+                                    "${domain}"
+                                ]
+                            }
+                        }
+                    ],
+                    "automatic_https":{
+                        "disable":true
+                    }
+                }
+            }
+        },
+        "tls":{
+            "certificates":{
+                "automate":[
+                    "${domain}"
+                ],
+                "load_files":[
+                    {
+                        "certificate":"${CADDY_CERT_DIR}${domain}/${domain}.crt",
+                        "key":"${CADDY_CERT_DIR}${domain}/${domain}.key"
+                    }
+                ]
+            },
+            "automation":{
+                "policies":[
+                    {
+                        "issuers":[
+                            {
+                                "module":"${ssl_module}",
+                                "email":"${your_email}"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    }
 }
 EOF
         break
       else
-        if [[ ${ssl_option} != 2 ]]; then
-          echo_content red "不可以输入除1和2之外的其他字符"
-        else
-
-          while read -r -p "请输入证书的.crt文件路径(必填): " crt_path; do
-            if [[ -z "${crt_path}" ]]; then
-              echo_content red "路径不能为空"
-            else
-              if [[ ! -f "${crt_path}" ]]; then
-                echo_content red "证书的.crt文件路径不存在"
-              else
-                cp "${crt_path}" "${CADDY_ACME}${domain}/${domain}.crt"
-                break
-              fi
-            fi
-          done
-
-          while read -r -p "请输入证书的.key文件路径(必填): " key_path; do
-            if [[ -z "${key_path}" ]]; then
-              echo_content red "路径不能为空"
-            else
-              if [[ ! -f "${key_path}" ]]; then
-                echo_content red "证书的.key文件路径不存在"
-              else
-                cp "${key_path}" "${CADDY_ACME}${domain}/${domain}.key"
-                break
-              fi
-            fi
-          done
-
-          cat >${CADDY_Caddyfile} <<EOF
-http://${domain}:80 {
-    redir https://${domain}:${caddy_remote_port}{url}
-}
-https://${domain}:${caddy_remote_port} {
-    gzip
-    tls /root/.caddy/acme/acme-v02.api.letsencrypt.org/sites/${domain}/${domain}.crt /root/.caddy/acme/acme-v02.api.letsencrypt.org/sites/${domain}/${domain}.key
-    root ${CADDY_SRV}
-}
-EOF
-          break
-        fi
+        echo_content red "不可以输入除1和2之外的其他字符"
       fi
     done
 
-    if [[ -n $(lsof -i:80,443 -t) ]]; then
-      kill -9 "$(lsof -i:80,443 -t)"
+    if [[ -n $(lsof -i:${caddy_port},443 -t) ]]; then
+      kill -9 "$(lsof -i:${caddy_port},443 -t)"
     fi
 
-    docker pull teddysun/caddy:1.0.5 &&
+    docker pull caddy:2.6.2 &&
       docker run -d --name trojan-panel-caddy --restart always \
         --network=host \
-        -v ${CADDY_Caddyfile}:"/etc/caddy/Caddyfile" \
-        -v ${CADDY_ACME}:"/root/.caddy/acme/acme-v02.api.letsencrypt.org/sites/" \
+        -v "${CADDY_Config}":"${CADDY_Config}" \
+        -v ${CADDY_CERT}:"${CADDY_CERT_DIR}${domain}/" \
         -v ${CADDY_SRV}:${CADDY_SRV} \
-        teddysun/caddy:1.0.5
+        -v ${CADDY_LOG}:${CADDY_LOG} \
+        caddy:2.6.2 caddy run --config ${CADDY_Config}
 
     if [[ -n $(docker ps -q -f "name=^trojan-panel-caddy$" -f "status=running") ]]; then
       cat >${DOMAIN_FILE} <<EOF
@@ -369,8 +620,8 @@ install_trojan_gfw_standalone() {
     ],
     "log_level": 1,
     "ssl": {
-        "cert": "${CADDY_ACME}${domain}/${domain}.crt",
-        "key": "${CADDY_ACME}${domain}/${domain}.key",
+        "cert": "${CADDY_CERT}${domain}.crt",
+        "key": "${CADDY_CERT}${domain}.key",
         "key_password": "",
         "cipher": "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384",
         "cipher_tls13": "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384",
@@ -414,7 +665,7 @@ EOF
       docker run -d --name trojan-panel-trojanGFW-standalone --restart always \
         --network=host \
         -v ${TROJANGFW_STANDALONE_CONFIG}:"/config/config.json" \
-        -v ${CADDY_ACME}:${CADDY_ACME} \
+        -v ${CADDY_CERT}:${CADDY_CERT} \
         trojangfw/trojan
 
     if [[ -n $(docker ps -q -f "name=^trojan-panel-trojanGFW-standalone$" -f "status=running") ]]; then
@@ -535,8 +786,8 @@ install_trojanGO_standalone() {
   "ssl": {
     "verify": true,
     "verify_hostname": true,
-    "cert": "${CADDY_ACME}${domain}/${domain}.crt",
-    "key": "${CADDY_ACME}${domain}/${domain}.key",
+    "cert": "${CADDY_CERT}${domain}.crt",
+    "key": "${CADDY_CERT}${domain}.key",
     "key_password": "",
     "cipher": "",
     "curves": "",
@@ -588,7 +839,7 @@ EOF
       docker run -d --name trojan-panel-trojanGO-standalone --restart=always \
         --network=host \
         -v ${TROJANGO_STANDALONE_CONFIG}:"/etc/trojan-go/config.json" \
-        -v ${CADDY_ACME}:${CADDY_ACME} \
+        -v ${CADDY_CERT}:${CADDY_CERT} \
         p4gefau1t/trojan-go
 
     if [[ -n $(docker ps -q -f "name=^trojan-panel-trojanGO-standalone$" -f "status=running") ]]; then
@@ -598,7 +849,7 @@ EOF
       echo_content yellow "域名: ${domain}"
       echo_content yellow "TrojanGO的端口: ${trojanGO_port}"
       echo_content yellow "TrojanGO的密码: ${trojan_pas}"
-      echo_content yellow "TrojanGO私钥和证书目录: ${CADDY_ACME}${domain}/"
+      echo_content yellow "TrojanGO私钥和证书目录: ${CADDY_CERT}"
       if [[ ${trojanGO_websocket_enable} == true ]]; then
         echo_content yellow "Websocket路径: ${trojanGO_websocket_path}"
       fi
@@ -655,11 +906,11 @@ install_hysteria_standalone() {
 {
   "listen": ":${hysteria_port}",
   "protocol": "${hysteria_protocol}",
-  "cert": "${CADDY_ACME}${domain}/${domain}.crt",
-  "key": "${CADDY_ACME}${domain}/${domain}.key",
+  "cert": "${CADDY_CERT}${domain}.crt",
+  "key": "${CADDY_CERT}${domain}.key",
   "up_mbps": ${hysteria_up_mbps},
   "down_mbps": ${hysteria_down_mbps},
-  "obfs": "${hysteria_password}"
+  "auth_str": "${hysteria_password}"
 }
 EOF
 
@@ -667,7 +918,7 @@ EOF
       docker run -d --name trojan-panel-hysteria-standalone --restart=always \
         --network=host \
         -v ${HYSTERIA_STANDALONE_CONFIG}:/etc/hysteria.json \
-        -v ${CADDY_ACME}:${CADDY_ACME} \
+        -v ${CADDY_CERT}:${CADDY_CERT} \
         tobyxdd/hysteria -c /etc/hysteria.json server
 
     if [[ -n $(docker ps -q -f "name=^trojan-panel-hysteria-standalone$" -f "status=running") ]]; then
@@ -677,7 +928,7 @@ EOF
       echo_content yellow "域名: ${domain}"
       echo_content yellow "Hysteria的端口: ${hysteria_port}"
       echo_content yellow "Hysteria的密码: ${hysteria_password}"
-      echo_content yellow "Hysteria私钥和证书目录: ${CADDY_ACME}${domain}/"
+      echo_content yellow "Hysteria私钥和证书目录: ${CADDY_CERT}"
       echo_content red "\n=============================================================="
     else
       echo_content red "---> Hysteria 安装失败或运行异常,请尝试修复或卸载重装"
@@ -685,6 +936,151 @@ EOF
     fi
   else
     echo_content skyBlue "---> 你已经安装了Hysteria"
+  fi
+}
+
+# 安装NaiveProxy(Caddy+ForwardProxy)
+install_navieproxy_standalone() {
+  if [[ -z $(docker ps -a -q -f "name=^trojan-panel-navieproxy-standalone$") ]]; then
+    echo_content green "---> 安装NaiveProxy(Caddy+ForwardProxy)"
+
+    read -r -p "请输入NaiveProxy的端口(默认:443): " naiveproxy_port
+    [[ -z "${naiveproxy_port}" ]] && naiveproxy_port=443
+    while read -r -p "请输入NaiveProxy的用户名(必填): " naiveproxy_username; do
+      if [[ -z "${naiveproxy_username}" ]]; then
+        echo_content red "用户名不能为空"
+      else
+        break
+      fi
+    done
+    while read -r -p "请输入NaiveProxy的密码(必填): " naiveproxy_pass; do
+      if [[ -z "${naiveproxy_pass}" ]]; then
+        echo_content red "密码不能为空"
+      else
+        break
+      fi
+    done
+    domain=$(cat "${DOMAIN_FILE}")
+    cat >${NAIVEPROXY_STANDALONE_CONFIG} <<EOF
+{
+    "admin": {
+        "disabled": true
+    },
+    "logging": {
+        "sink": {
+            "writer": {
+                "output": "discard"
+            }
+        },
+        "logs": {
+            "default": {
+                "writer": {
+                    "output": "discard"
+                }
+            }
+        }
+    },
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":${naiveproxy_port}"
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "handler": "subroute",
+                                    "routes": [
+                                        {
+                                            "handle": [
+                                                {
+                                                    "auth_pass_deprecated": "${naiveproxy_pass}",
+                                                    "auth_user_deprecated": "${naiveproxy_username}",
+                                                    "handler": "forward_proxy",
+                                                    "hide_ip": true,
+                                                    "hide_via": true,
+                                                    "probe_resistance": {}
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "match": [
+                                                {
+                                                    "host": [
+                                                        "${domain}"
+                                                    ]
+                                                }
+                                            ],
+                                            "handle": [
+                                                {
+                                                    "handler": "file_server",
+                                                    "root": "/caddy-forwardproxy/dist/",
+                                                    "index_names": [
+                                                        "index.html",
+                                                        "index.htm"
+                                                    ]
+                                                }
+                                            ],
+                                            "terminal": true
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                    "tls_connection_policies": [
+                        {
+                            "match": {
+                                "sni": [
+                                    "${domain}"
+                                ]
+                            }
+                        }
+                    ],
+                    "automatic_https": {
+                        "disable": true
+                    }
+                }
+            }
+        },
+        "tls": {
+            "certificates": {
+                "load_files": [
+                    {
+                        "certificate": "${CADDY_CERT}${domain}.crt",
+                        "key": "${CADDY_CERT}${domain}.crt"
+                    }
+                ]
+            }
+        }
+    }
+}
+EOF
+    docker pull jonssonyan/caddy-forwardproxy &&
+      docker run -d --name trojan-panel-navieproxy-standalone --restart=always \
+        --network=host \
+        -v ${NAIVEPROXY_STANDALONE_CONFIG}:"/caddy-forwardproxy/config/config.json" \
+        -v ${CADDY_CERT}:${CADDY_CERT} \
+        jonssonyan/caddy-forwardproxy
+
+    if [[ -n $(docker ps -q -f "name=^trojan-panel-navieproxy-standalone$" -f "status=running") ]]; then
+      echo_content skyBlue "---> NaiveProxy(Caddy+ForwardProxy) 安装完成"
+      echo_content red "\n=============================================================="
+      echo_content skyBlue "NaiveProxy(Caddy+ForwardProxy) 安装成功"
+      echo_content yellow "域名: ${domain}"
+      echo_content yellow "NaiveProxy的端口: ${naiveproxy_port}"
+      echo_content yellow "NaiveProxy的用户名: ${naiveproxy_username}"
+      echo_content yellow "NaiveProxy的密码: ${naiveproxy_pass}"
+      echo_content yellow "NaiveProxy私钥和证书目录: ${CADDY_CERT}"
+      echo_content red "\n=============================================================="
+    else
+      echo_content red "---> NaiveProxy(Caddy+ForwardProxy) 安装失败或运行异常,请尝试修复或卸载重装"
+      exit 0
+    fi
+  else
+    echo_content skyBlue "---> 你已经了安装了NaiveProxy(Caddy+ForwardProxy)"
   fi
 }
 
@@ -748,6 +1144,21 @@ uninstall_hysteria_standalone() {
   fi
 }
 
+# 卸载NaiveProxy(Caddy+ForwardProxy)
+uninstall_navieproxy_standalone() {
+  if [[ -n $(docker ps -a -q -f "name=^trojan-panel-navieproxy-standalone$") ]]; then
+    echo_content green "---> 卸载NaiveProxy(Caddy+ForwardProxy)"
+
+    docker rm -f trojan-panel-navieproxy-standalone &&
+      docker rmi -f jonssonyan/caddy-forwardproxy &&
+      rm -f ${NAIVEPROXY_STANDALONE_CONFIG}
+
+    echo_content skyBlue "---> NaiveProxy(Caddy+ForwardProxy) 卸载完成"
+  else
+    echo_content red "---> 请先安装NaiveProxy(Caddy+ForwardProxy)"
+  fi
+}
+
 # 卸载全部Trojan Panel相关的容器
 uninstall_all() {
   echo_content green "---> 卸载全部Trojan Panel相关的容器"
@@ -766,11 +1177,17 @@ failure_testing() {
   else
     if [[ -n $(docker ps -a -q -f "name=^trojan-panel-caddy$") ]]; then
       if [[ -z $(docker ps -q -f "name=^trojan-panel-caddy$" -f "status=running") ]]; then
-        echo_content red "---> Caddy TLS运行异常"
+        echo_content red "---> Caddy TLS运行异常 错误日志如下："
+        docker logs trojan-panel-caddy
       fi
       domain=$(cat "${DOMAIN_FILE}")
-      if [[ -z $(cat "${DOMAIN_FILE}") || ! -d "${CADDY_ACME}${domain}" || ! -f "${CADDY_ACME}${domain}/${domain}.crt" ]]; then
-        echo_content red "---> 证书申请异常，请尝试重启服务器将重新申请证书或者重新搭建选择自定义证书选项"
+      if [[ -z $(cat "${DOMAIN_FILE}") || ! -d "${CADDY_CERT}" || ! -f "${CADDY_CERT}${domain}.crt" ]]; then
+        echo_content red "---> 证书申请异常，请尝试 1.换个子域名重新搭建 2.重启服务器将重新申请证书 3.重新搭建选择自定义证书选项 日志如下："
+        if [[ -f ${CADDY_LOG}error.log ]]; then
+          tail -n 20 ${CADDY_LOG}error.log
+        else
+          docker logs trojan-panel-caddy
+        fi
       fi
     fi
     if [[ -n $(docker ps -a -q -f "name=^trojan-panel-trojanGFW-standalone$") && -z $(docker ps -q -f "name=^trojan-panel-trojanGFW-standalone$" -f "status=running") ]]; then
@@ -782,33 +1199,11 @@ failure_testing() {
     if [[ -n $(docker ps -a -q -f "name=^trojan-panel-hysteria-standalone$") && -z $(docker ps -q -f "name=^trojan-panel-hysteria-standalone$" -f "status=running") ]]; then
       echo_content red "---> Hysteria运行异常"
     fi
+    if [[ -n $(docker ps -a -q -f "name=^trojan-panel-navieproxy-standalone$") && -z $(docker ps -q -f "name=^trojan-panel-navieproxy-standalone$" -f "status=running") ]]; then
+      echo_content red "---> NaiveProxy(Caddy+ForwardProxy)运行异常"
+    fi
   fi
   echo_content green "---> 故障检测结束"
-}
-
-# 卸载阿里云内置相关监控
-uninstall_aliyun() {
-  # 卸载云监控(Cloudmonitor) Java 版
-  /usr/local/cloudmonitor/wrapper/bin/cloudmonitor.sh stop &&
-    /usr/local/cloudmonitor/wrapper/bin/cloudmonitor.sh remove &&
-    rm -rf /usr/local/cloudmonitor
-  # 卸载云盾(安骑士)
-  wget --no-check-certificate -O uninstall.sh http://update.aegis.aliyun.com/download/uninstall.sh && chmod +x uninstall.sh && ./uninstall.sh
-  wget --no-check-certificate -O quartz_uninstall.sh http://update.aegis.aliyun.com/download/quartz_uninstall.sh && chmod +x quartz_uninstall.sh && ./quartz_uninstall.sh
-  pkill aliyun-service
-  rm -fr /etc/init.d/agentwatch /usr/sbin/aliyun-service
-  rm -rf /usr/local/aegis*
-  iptables -I INPUT -s 140.205.201.0/28 -j DROP
-  iptables -I INPUT -s 140.205.201.16/29 -j DROP
-  iptables -I INPUT -s 140.205.201.32/28 -j DROP
-  iptables -I INPUT -s 140.205.225.192/29 -j DROP
-  iptables -I INPUT -s 140.205.225.200/30 -j DROP
-  iptables -I INPUT -s 140.205.225.184/29 -j DROP
-  iptables -I INPUT -s 140.205.225.183/32 -j DROP
-  iptables -I INPUT -s 140.205.225.206/32 -j DROP
-  iptables -I INPUT -s 140.205.225.205/32 -j DROP
-  iptables -I INPUT -s 140.205.225.195/32 -j DROP
-  iptables -I INPUT -s 140.205.225.204/32 -j DROP
 }
 
 main() {
@@ -820,7 +1215,7 @@ main() {
   clear
   echo_content red "\n=============================================================="
   echo_content skyBlue "System Required: CentOS 7+/Ubuntu 18+/Debian 10+"
-  echo_content skyBlue "Version: v1.0.0"
+  echo_content skyBlue "Version: v2.0.4"
   echo_content skyBlue "Description: One click Install Trojan Panel standalone server"
   echo_content skyBlue "Author: jonssonyan <https://jonssonyan.com>"
   echo_content skyBlue "Github: https://github.com/trojanpanel"
@@ -829,15 +1224,17 @@ main() {
   echo_content yellow "1. 安装TrojanGFW+Caddy+Web+TLS"
   echo_content yellow "2. 安装TrojanGO+Caddy+Web+TLS+Websocket"
   echo_content yellow "3. 安装Hysteria"
-  echo_content yellow "4. 安装Caddy TLS"
+  echo_content yellow "4. 安装NaiveProxy(Caddy+ForwardProxy)"
+  echo_content yellow "5. 安装Caddy TLS"
   echo_content green "\n=============================================================="
-  echo_content yellow "5. 卸载TrojanGFW+Caddy+Web+TLS"
-  echo_content yellow "6. 卸载TrojanGO+Caddy+Web+TLS+Websocket"
-  echo_content yellow "7. 卸载Hysteria"
-  echo_content yellow "8. 卸载Caddy TLS"
-  echo_content yellow "9. 卸载全部Trojan Panel相关的应用"
+  echo_content yellow "6. 卸载TrojanGFW+Caddy+Web+TLS"
+  echo_content yellow "7. 卸载TrojanGO+Caddy+Web+TLS+Websocket"
+  echo_content yellow "8. 卸载Hysteria"
+  echo_content yellow "9. 卸载NaiveProxy(Caddy+ForwardProxy)"
+  echo_content yellow "10. 卸载Caddy TLS"
+  echo_content yellow "11. 卸载全部Trojan Panel相关的应用"
   echo_content green "\n=============================================================="
-  echo_content yellow "10. 故障检测"
+  echo_content yellow "12. 故障检测"
   read -r -p "请选择:" selectInstall_type
   case ${selectInstall_type} in
   1)
@@ -858,23 +1255,31 @@ main() {
   4)
     install_docker
     install_caddy_tls
+    install_navieproxy_standalone
     ;;
   5)
-    uninstall_trojan_gfw_standalone
+    install_docker
+    install_caddy_tls
     ;;
   6)
-    uninstall_trojanGO_standalone
+    uninstall_trojan_gfw_standalone
     ;;
   7)
-    uninstall_hysteria_standalone
+    uninstall_trojanGO_standalone
     ;;
   8)
-    uninstall_caddy_tls
+    uninstall_hysteria_standalone
     ;;
   9)
-    uninstall_all
+    uninstall_navieproxy_standalone
     ;;
   10)
+    uninstall_caddy_tls
+    ;;
+  11)
+    uninstall_all
+    ;;
+  12)
     failure_testing
     ;;
   *)
